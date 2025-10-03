@@ -72,19 +72,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-# ---- copy api + web builds
+
+# --- copy code/builds ---
 COPY --from=apibuild /app/api /app/api
-COPY --from=webbuild /app/web/.next /app/web/.next
-COPY --from=webbuild /app/web/package.json /app/web/package.json
-COPY --from=webbuild /app/web/node_modules /app/web/node_modules
+COPY --from=webbuild  /app/web/.next /app/web/.next
+COPY --from=webbuild  /app/web/package.json /app/web/package.json
+COPY --from=webbuild  /app/web/node_modules /app/web/node_modules
 
-# ---- prepare storage and logs
-RUN mkdir -p /temp/api-storage && chown -R node:node /temp /var/log
+# --- install runtime python deps (this was missing) ---
+# copy a clean requirements file and install into THIS final image
+COPY --from=source /src/api/requirements.txt /tmp/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r /tmp/requirements.txt && \
+    pip install --no-cache-dir gunicorn uvicorn gevent celery
 
-# ---- install gunicorn/celery
-RUN pip3 install --no-cache-dir gunicorn gevent celery
+# --- storage & perms ---
+RUN mkdir -p /temp/api-storage && chown -R node:node /temp /var/log /app
 
-# ---- copy supervisor + entrypoint
+# --- supervisor + entrypoint ---
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -95,3 +100,4 @@ ENV PORT_WEB=8080 \
 
 EXPOSE 8080 5001
 ENTRYPOINT ["/entrypoint.sh"]
+
