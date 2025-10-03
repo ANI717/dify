@@ -1,103 +1,104 @@
 # ==========================
-# Stage 1: clone repo
+# Stage 1: fetch Dify at a fixed ref
 # ==========================
 FROM alpine/git AS source
-ARG DIFY_REF=1.9.1   # can be a tag like 1.9.0 or an exact commit SHA
+ARG DIFY_REF=1.9.0          # pin to a tag or commit SHA you trust
 WORKDIR /src
 RUN git clone https://github.com/langgenius/dify.git . \
  && git checkout --detach "$DIFY_REF"
 
 # ==========================
-# Stage 2: build web (Next.js)
+# Stage 2: build Web (Next.js) with pnpm
 # ==========================
-FROM node:18-bullseye AS webbuild
+FROM node:18-bookworm AS webbuild
 WORKDIR /app/web
 
-# Copy only lockfiles first for better caching
+# lockfiles first for caching
 COPY --from=source /src/web/package.json /src/web/pnpm-lock.yaml* /src/web/yarn.lock* /src/web/package-lock.json* ./
 
-# Use Corepack to get the right package manager versions
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     NEXT_TELEMETRY_DISABLED=1 \
     NODE_OPTIONS=--max_old_space_size=4096 \
     PUPPETEER_SKIP_DOWNLOAD=1
 RUN corepack enable
 
-# Install deps using the lockfile that exists (prefer pnpm)
-# - pnpm (frozen) -> yarn (frozen) -> npm ci -> npm install (legacy peer deps)
+# install deps (prefer pnpm)
 RUN if [ -f pnpm-lock.yaml ]; then \
-      corepack prepare pnpm@latest --activate && \
-      pnpm install --frozen-lockfile; \
+      corepack prepare pnpm@latest --activate && pnpm install --frozen-lockfile; \
     elif [ -f yarn.lock ]; then \
-      corepack prepare yarn@stable --activate && \
-      yarn install --frozen-lockfile; \
+      corepack prepare yarn@stable --activate && yarn install --frozen-lockfile; \
     elif [ -f package-lock.json ]; then \
       npm ci --no-audit --no-fund; \
     else \
       npm install --legacy-peer-deps --no-audit --no-fund; \
     fi
 
-# Now copy the actual sources and build
+# copy sources & build
 COPY --from=source /src/web/ ./
+# Keep this generic so NGINX can proxy /api → API
 ENV NEXT_PUBLIC_API_URL=/api
-RUN if [ -f pnpm-lock.yaml ]; then \
-      pnpm run build; \
-    elif [ -f yarn.lock ]; then \
-      yarn build; \
-    else \
-      npm run build; \
-    fi
-
+RUN if [ -f pnpm-lock.yaml ]; then pnpm run build; \
+    elif [ -f yarn.lock ]; then yarn build; \
+    else npm run build; fi
 
 # ==========================
-# Stage 3: build api
+# Stage 3: final runtime (Node + Python 3.11 + uv + Supervisor)
 # ==========================
-FROM python:3.11-slim AS apibuild
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+FROM node:18-bookworm
+
+# Python 3.11 and runtime deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential gcc git pkg-config libpq-dev curl && \
-    rm -rf /var/lib/apt/lists/*
-WORKDIR /app/api
-COPY --from=source /src/api/ ./
-RUN pip install --upgrade pip setuptools wheel && \
-    if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+      python3 python3-venv python3-pip \
+      build-essential pkg-config libpq-dev libpq5 \
+      supervisor curl ca-certificates bash git \
+ && ln -sf /usr/bin/python3 /usr/bin/python \
+ && rm -rf /var/lib/apt/lists/*
 
-# ==========================
-# Stage 4: final runtime
-# ==========================
-FROM node:18-bullseye
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip libpq5 supervisor curl && \
-    ln -sf /usr/bin/python3 /usr/bin/python && \
-    rm -rf /var/lib/apt/lists/*
+# Install uv (Astral) for Python deps
+RUN curl -LsSf https://astral.sh/uv/install.sh | bash
+ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
 
-# --- copy code/builds ---
-COPY --from=apibuild /app/api /app/api
-COPY --from=webbuild  /app/web/.next /app/web/.next
-COPY --from=webbuild  /app/web/package.json /app/web/package.json
-COPY --from=webbuild  /app/web/node_modules /app/web/node_modules
+# --- API: copy source and install deps into an in-project venv
+COPY --from=source /src/api/ /app/api/
+WORKDIR /app/api
 
-# --- install runtime python deps (this was missing) ---
-# copy a clean requirements file and install into THIS final image
-COPY --from=source /src/api/requirements.txt /tmp/requirements.txt
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r /tmp/requirements.txt && \
-    pip install --no-cache-dir gunicorn uvicorn gevent celery
+# Create venv explicitly so .venv exists, then sync deps into that venv
+RUN python -m venv .venv
+ENV VIRTUAL_ENV=/app/api/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
-# --- storage & perms ---
+# If uv.lock exists, use --frozen; otherwise resolve
+RUN if [ -f uv.lock ]; then \
+      uv sync --no-dev --frozen --python "${VIRTUAL_ENV}/bin/python"; \
+    else \
+      uv sync --no-dev --python "${VIRTUAL_ENV}/bin/python"; \
+    fi
+
+# Ensure runtime servers/tools are installed in the same venv
+RUN pip install --no-cache-dir gunicorn uvicorn gevent celery
+
+# --- Web: copy built artifacts
+WORKDIR /app
+COPY --from=webbuild /app/web/.next        /app/web/.next
+COPY --from=webbuild /app/web/package.json /app/web/package.json
+COPY --from=webbuild /app/web/node_modules /app/web/node_modules
+COPY --from=webbuild /app/web/public       /app/web/public
+
+# --- Storage & perms
 RUN mkdir -p /temp/api-storage && chown -R node:node /temp /var/log /app
 
-# --- supervisor + entrypoint ---
+# --- Your supervisor config & entrypoint (already in your repo)
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/entrypoint.sh    /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Minimal defaults (override via .env at run)
 ENV PORT_WEB=8080 \
     PORT_API=5001 \
     STORAGE_LOCAL_PATH=/temp/api-storage
 
-EXPOSE 8080 5001
+# Expose only web; API stays internal on 5001
+EXPOSE 8080
 ENTRYPOINT ["/entrypoint.sh"]
-
